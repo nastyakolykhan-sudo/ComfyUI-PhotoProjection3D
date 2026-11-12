@@ -1,4 +1,4 @@
-"""Run the projection outside ComfyUI: python tests/run_local.py MODEL.glb PHOTO MASK OUT.glb [--texture 4096]
+"""Run the projection outside ComfyUI: python tests/run_local.py MODEL.glb PHOTO MASK OUT.glb [--texture 4096] [--label-free CLEAN.png]
 MASK: a greyscale image, white = object. Writes OUT.glb and OUT_fit.png (fitted outline over the photo)."""
 import argparse, json, os, sys, time
 
@@ -10,12 +10,14 @@ from projection_core import project_photo  # noqa: E402
 
 ap = argparse.ArgumentParser()
 ap.add_argument("glb"); ap.add_argument("photo"); ap.add_argument("mask"); ap.add_argument("out")
-ap.add_argument("--texture", type=int, default=4096)
+ap.add_argument("--texture", type=int, default=4096); ap.add_argument("--label-free", default="")
+ap.add_argument("--edge-zone", type=float, default=0.03); ap.add_argument("--fine", type=int, default=896)
 a = ap.parse_args()
 photo = np.asarray(Image.open(a.photo).convert("RGB"))
 mask = np.asarray(Image.open(a.mask).convert("L").resize(photo.shape[1::-1]), np.float32) / 255
 t = time.time()
-glb, preview, info = project_photo(open(a.glb, "rb").read(), photo, mask, texture_size=a.texture)
+lf = np.asarray(Image.open(a.label_free).convert("RGB")) if a.label_free else None
+glb, preview, info = project_photo(open(a.glb, "rb").read(), photo, mask, texture_size=a.texture, label_free_rgb=lf, edge_zone=a.edge_zone, fine_work=a.fine)
 open(a.out, "wb").write(glb)
 Image.fromarray(preview).save(os.path.splitext(a.out)[0] + "_fit.png")
 info.update(seconds=round(time.time() - t, 1), mb=round(len(glb) / 1e6, 1))
