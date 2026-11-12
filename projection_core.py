@@ -15,6 +15,9 @@ Steps
 3. Colour match: the model's texture is pulled towards the photo's colours, per colour, using the texels both
    see (so a red-only overlap can't tint greys). The normal map is flattened where the photo goes on, so no
    invented relief shows under real print.
+4. More photos (optional): other views of the same object (back, sides) are fitted the same way, each searched
+   around its expected direction from the main photo, and projected too. Where several photos see a surface, the
+   one facing it most squarely wins, with a narrow hand-over; the main photo is favoured where it sees well.
 
 Stack: numpy, scipy, Pillow, trimesh (MIT), moderngl (MIT; EGL on headless Linux).
 """
@@ -279,31 +282,109 @@ def zone_fix(albedo_rgba, dist, valid, r, M_render_to_crop, crop, photo, mask, l
 
 
 # ----------------------------------------------------------------------------- main
+class _FitPass:
+    """Render + score at one working resolution (render frame R x R, photo scaled by k)."""
+
+    def __init__(self, ctx, prog, gl_parts, c, r, R, photo_size, mask_img, fit_ref):
+        PW, PH = photo_size
+        self.ctx, self.prog, self.gl_parts, self.c, self.r = ctx, prog, gl_parts, c, r
+        self.R = R; self.k = R / max(PW, PH); self.WW, self.WH = round(PW * self.k), round(PH * self.k)
+        self.pm = np.asarray(mask_img.resize((self.WW, self.WH), Image.BILINEAR), np.float32) / 255
+        self.pl = ndimage.gaussian_filter(np.asarray(fit_ref.resize((self.WW, self.WH), Image.BILINEAR).convert("L"), np.float32) / 255, 1.0 * R / 320)
+        self.fbo = ctx.framebuffer(ctx.renderbuffer((R, R), 4), ctx.depth_renderbuffer((R, R)))
+
+    def render(self, yaw, pitch, roll, fov):
+        import moderngl
+
+        mvp, _ = camera(self.c, self.r, yaw, pitch, roll, fov)
+        self.prog["mvp"].write(mvp.T.tobytes()); self.prog["albedo"].value = 0
+        self.fbo.use(); self.ctx.enable(moderngl.DEPTH_TEST); self.ctx.clear(0, 0, 0, 0)
+        for tex, _, vao in self.gl_parts:
+            tex.use(0); vao.render()
+        R = self.R
+        return np.frombuffer(self.fbo.read(components=4), np.uint8).reshape(R, R, 4)[::-1].astype(np.float32) / 255
+
+    def warp(self, arr, s, tx, ty):
+        A = (1 / s, 0, -tx / s, 0, 1 / s, -ty / s)
+        return np.asarray(Image.fromarray((arr * 255).astype(np.uint8)).transform((self.WW, self.WH), Image.AFFINE, A, Image.BILINEAR), np.float32) / 255
+
+    def score(self, img, s, tx, ty):
+        rm = self.warp(img[..., 3], s, tx, ty)
+        iou = np.minimum(rm, self.pm).sum() / max(np.maximum(rm, self.pm).sum(), 1e-6)
+        rl = ndimage.gaussian_filter(self.warp(img[..., :3] @ np.array([0.299, 0.587, 0.114], np.float32), s, tx, ty), 1.0 * self.R / 320)
+        sel = (rm > 0.5) & (self.pm > 0.5)
+        if sel.sum() < 50:
+            return iou
+        x, y = rl[sel] - rl[sel].mean(), self.pl[sel] - self.pl[sel].mean()
+        return iou + 0.5 * float((x * y).sum() / (np.sqrt((x * x).sum() * (y * y).sum()) + 1e-6))
+
+    def f(self, p):
+        yaw, pitch, roll, lfov, ls, tx, ty = p
+        fov = float(np.clip(math.exp(lfov), 6, 60))
+        return -self.score(self.render(yaw, pitch, roll, fov), math.exp(ls), tx, ty)
+
+
+def _angle_diff(a, b):
+    return abs((a - b + 180.0) % 360.0 - 180.0)
+
+
+def _fit_camera(ctx, prog, gl_parts, c, r, photo_size, mask_img, fit_ref, work, fine_work, yaw_window, info):
+    """Coarse grid + Nelder-Mead at `work`, then a refinement at `fine_work`. yaw_window: (centre, half-width) in
+    degrees to search only around an expected direction (extra views), or None for all round.
+    Returns (pass, params[yaw, pitch, roll, log fov, log scale, tx, ty])."""
+    A1 = _FitPass(ctx, prog, gl_parts, c, r, work, photo_size, mask_img, fit_ref)
+    R = A1.R; yy, xx = np.mgrid[0:R, 0:R]; Y, X = np.mgrid[0:A1.WH, 0:A1.WW]; ap_ = A1.pm.sum()
+    cp = np.array([(X * A1.pm).sum() / max(ap_, 1e-6), (Y * A1.pm).sum() / max(ap_, 1e-6)])
+    yaws = [y for y in range(-180, 180, 15) if yaw_window is None or _angle_diff(y, yaw_window[0]) <= yaw_window[1]]
+    cands = []
+    for fov in (12.0, 25.0, 40.0):
+        for pitch in range(-10, 41, 10):
+            for yaw in yaws:
+                img = A1.render(yaw, pitch, 0, fov); al = img[..., 3]; ar = al.sum()
+                if ar < 10:
+                    continue
+                s0 = math.sqrt(ap_ / ar); cr = np.array([(xx * al).sum() / ar, (yy * al).sum() / ar]); t0 = cp - s0 * cr
+                cands.append((A1.score(img, s0, t0[0], t0[1]), yaw, pitch, fov, (s0, t0[0], t0[1])))
+    cands.sort(key=lambda z: -z[0])
+    best = None
+    for _, yaw, pitch, fov, (s0, tx0, ty0) in cands[:6]:
+        x0 = np.array([yaw, pitch, 0.0, math.log(fov), math.log(s0), tx0, ty0])
+        simplex = np.array([x0] + [x0 + dd for dd in np.diag([8, 6, 4, 0.3, 0.05, 6, 6])])
+        res = optimize.minimize(A1.f, x0, method="Nelder-Mead", options={"initial_simplex": simplex, "maxiter": 400, "xatol": 0.05, "fatol": 1e-4})
+        if best is None or res.fun < best.fun:
+            best = res
+    fit_pass, x = A1, best.x
+    info["fit_score"] = round(float(-best.fun), 3)
+    if fine_work and fine_work > work:
+        A2 = _FitPass(ctx, prog, gl_parts, c, r, int(fine_work), photo_size, mask_img, fit_ref); q = A2.R / A1.R
+        x2 = x.copy(); x2[5:7] *= q
+        simplex = np.array([x2] + [x2 + dd for dd in np.diag([1.5, 1.2, 0.8, 0.05, 0.01, 2.0, 2.0])])
+        res2 = optimize.minimize(A2.f, x2, method="Nelder-Mead", options={"initial_simplex": simplex, "maxiter": 120, "xatol": 0.02, "fatol": 1e-5})
+        info["fine_score_start"] = round(float(-A2.f(x2)), 4); info["fine_score"] = round(float(-res2.fun), 4)
+        if res2.fun <= A2.f(x2):
+            fit_pass, x = A2, res2.x
+    return fit_pass, x
+
+
 def project_photo(glb_bytes, photo_rgb, mask=None, texture_size=4096, facing=(0.20, 0.55), match_colours=True,
                   flatten_normals=True, jpeg_quality=92, work=320, label_free_rgb=None, edge_zone=0.03, fine_work=896,
-                  mismatch=1.0):
+                  mismatch=1.0, extra_views=None, main_bias=1.25, sharpness=12.0, view_window=60.0):
     """photo_rgb: HxWx3 uint8. mask: HxW float 0-1 (subject), optional. label_free_rgb: the label-free copy the
     model was built from (optional): fits the camera against it and enables the edge-zone fix.
+    extra_views: optional list of more photos of the same object, each a dict with "photo" (HxWx3 uint8), "mask"
+    (HxW float or None), "label_free" (HxWx3 uint8 or None), "name" and "yaw_offset" (degrees around the object
+    from the main photo's camera: 180 back, -90 left, +90 right; None searches all round). Every view is fitted
+    and projected; where several see a surface, the one facing it most squarely wins (the main photo is favoured
+    by `main_bias`).
     Returns (glb_bytes, preview HxWx3 uint8, info dict)."""
     import moderngl
 
     scene, parts = load_model(glb_bytes)
-    photo = Image.fromarray(photo_rgb); PW, PH = photo.size
-    if mask is None:
-        mask_img = Image.new("L", photo.size, 255)
-    else:
-        mask_img = Image.fromarray((np.clip(mask, 0, 1) * 255).astype(np.uint8)).resize(photo.size, Image.BILINEAR)
-    info = {}
-    label_free = None
-    if label_free_rgb is not None:
-        try:
-            label_free = register_label_free(Image.fromarray(label_free_rgb), photo)
-            info["label_free"] = "registered" if label_free is not None else "could not be lined up, not used"
-        except ImportError:
-            info["label_free"] = "opencv missing, not used"
     allpos = np.vstack([p.pos for p in parts]); c = (allpos.min(0) + allpos.max(0)) / 2
     r = float(np.linalg.norm(allpos - c, axis=1).max())
-    fit_ref = label_free if label_free is not None else photo   # label-free like the model's own texture
+    views = [dict(name="main", photo=photo_rgb, mask=mask, label_free=label_free_rgb, yaw_offset=None)]
+    views += [v for v in (extra_views or []) if v is not None and v.get("photo") is not None]
+    info = {}
 
     ctx = gl_context()
     try:
@@ -316,144 +397,124 @@ def project_photo(glb_bytes, photo_rgb, mask=None, texture_size=4096, facing=(0.
             ibo = ctx.buffer(p.faces.tobytes())
             vao = ctx.vertex_array(fit_prog, [(ctx.buffer(np.hstack([p.pos, p.uv]).astype("f4").tobytes()), "3f 2f", "in_pos", "in_uv")], ibo)
             gl_parts.append((tex, ibo, vao))
+        dist_prog = ctx.program(vertex_shader=DIST_VS, fragment_shader=DIST_FS)
+        DR = 2048
 
-        class Pass:
-            """Render + score at one working resolution (render frame R x R, photo scaled by k)."""
-            def __init__(self, R):
-                self.R = R; self.k = R / max(PW, PH); self.WW, self.WH = round(PW * self.k), round(PH * self.k)
-                self.pm = np.asarray(mask_img.resize((self.WW, self.WH), Image.BILINEAR), np.float32) / 255
-                self.pl = ndimage.gaussian_filter(np.asarray(fit_ref.resize((self.WW, self.WH), Image.BILINEAR).convert("L"), np.float32) / 255, 1.0 * R / 320)
-                self.fbo = ctx.framebuffer(ctx.renderbuffer((R, R), 4), ctx.depth_renderbuffer((R, R)))
+        prepared, previews, main_yaw = [], [], None
+        for vi, v in enumerate(views):
+            vinfo = info if vi == 0 else {"name": v.get("name", f"view {vi}")}
+            photo = Image.fromarray(np.ascontiguousarray(v["photo"])); PW, PH = photo.size
+            if v.get("mask") is None:
+                mask_img = Image.new("L", photo.size, 255)
+            else:
+                mask_img = Image.fromarray((np.clip(v["mask"], 0, 1) * 255).astype(np.uint8)).resize(photo.size, Image.BILINEAR)
+            label_free = None
+            if v.get("label_free") is not None:
+                try:
+                    label_free = register_label_free(Image.fromarray(np.ascontiguousarray(v["label_free"])), photo)
+                    vinfo["label_free"] = "registered" if label_free is not None else "could not be lined up, not used"
+                except ImportError:
+                    vinfo["label_free"] = "opencv missing, not used"
+            fit_ref = label_free if label_free is not None else photo   # label-free like the model's own texture
+            window = None
+            if vi > 0 and main_yaw is not None and v.get("yaw_offset") is not None:
+                window = (main_yaw + float(v["yaw_offset"]), float(view_window))
+            fit_pass, x = _fit_camera(ctx, fit_prog, gl_parts, c, r, (PW, PH), mask_img, fit_ref, work, fine_work, window, vinfo)
+            yaw, pitch, roll, lfov, ls, tx, ty = x
+            fov = float(np.clip(math.exp(lfov), 6, 60)); s = math.exp(ls); R = fit_pass.R; k = fit_pass.k
+            vinfo.update(yaw=round(float(yaw), 2), pitch=round(float(pitch), 2), roll=round(float(roll), 2), fov=round(float(fov), 2))
+            if vi == 0:
+                main_yaw = float(yaw)
+            log.info("Photo Projection: camera fit (%s) %s", v.get("name", "main"), vinfo)
 
-            def render(self, yaw, pitch, roll, fov):
-                mvp, _ = camera(c, r, yaw, pitch, roll, fov)
+            # preview: fitted outline over the photo
+            img = fit_pass.render(yaw, pitch, roll, fov)
+            rm = Image.fromarray((fit_pass.warp(img[..., 3], s, tx, ty) * 255).astype(np.uint8)).resize((PW, PH), Image.BILINEAR)
+            edge = np.asarray(rm.filter(ImageFilter.FIND_EDGES).filter(ImageFilter.MaxFilter(3))) > 40
+            pv_img = np.asarray(photo).copy(); pv_img[edge] = (0, 200, 255); previews.append(pv_img)
+
+            # distance map from this camera (visibility)
+            S_full, T_full = s / k, np.array([tx, ty]) / k
+            mvp, eye = camera(c, r, yaw, pitch, roll, fov)
+            dtex = ctx.texture((DR, DR), 1, dtype="f4"); dfbo = ctx.framebuffer([dtex], ctx.depth_renderbuffer((DR, DR)))
+            dist_prog["mvp"].write(mvp.T.tobytes()); dist_prog["eye"].value = tuple(float(q) for q in eye)
+            dfbo.use(); ctx.enable(moderngl.DEPTH_TEST); dfbo.clear(1e9, 1e9, 1e9, 1e9)
+            for p, (_, ibo, _) in zip(parts, gl_parts):
+                ctx.vertex_array(dist_prog, [(ctx.buffer(p.pos.astype("f4").tobytes()), "3f", "in_pos")], ibo).render()
+            dtex.filter = (moderngl.NEAREST, moderngl.NEAREST)
+
+            proj_photo, proj_mask = photo, mask_img
+            if label_free is not None and edge_zone > 0:
+                import cv2
+                hfbo = ctx.framebuffer(ctx.renderbuffer((DR, DR), 4), ctx.depth_renderbuffer((DR, DR)))
                 fit_prog["mvp"].write(mvp.T.tobytes()); fit_prog["albedo"].value = 0
-                self.fbo.use(); ctx.enable(moderngl.DEPTH_TEST); ctx.clear(0, 0, 0, 0)
+                hfbo.use(); ctx.enable(moderngl.DEPTH_TEST); ctx.clear(0, 0, 0, 0)
                 for tex, _, vao in gl_parts:
                     tex.use(0); vao.render()
-                R = self.R
-                return np.frombuffer(self.fbo.read(components=4), np.uint8).reshape(R, R, 4)[::-1].astype(np.float32) / 255
+                alb = np.ascontiguousarray(np.frombuffer(hfbo.read(components=4), np.uint8).reshape(DR, DR, 4)[::-1]); hfbo.release()
+                dist = np.ascontiguousarray(np.frombuffer(dtex.read(), np.float32).reshape(DR, DR)[::-1])
+                mk_arr = np.asarray(mask_img); ys, xs = np.nonzero(mk_arr > 128)
+                if len(xs):
+                    bx0, bx1, by0, by1 = xs.min(), xs.max(), ys.min(), ys.max(); mg = 0.06 * max(bx1 - bx0, by1 - by0)
+                    crop = (int(max(0, bx0 - mg)), int(max(0, by0 - mg)), int(min(PW, bx1 + mg)), int(min(PH, by1 + mg)))
+                    cw, chh = crop[2] - crop[0], crop[3] - crop[1]; kt = 1024 / max(cw, chh); tw, th = round(cw * kt), round(chh * kt)
+                    A2s = kt * S_full * R / DR; b2 = kt * (T_full - np.array([crop[0], crop[1]]))
+                    Mrc = np.float32([[A2s, 0, b2[0]], [0, A2s, b2[1]]])
+                    alb = cv2.GaussianBlur(alb, (0, 0), max(0.5, 0.5 / A2s))
+                    proj_photo, proj_mask = zone_fix(alb, dist, dist < 1e8, r, (Mrc, (tw, th), kt), crop, photo, mask_img, label_free,
+                                                     edge_zone, mismatch, vinfo)
 
-            def warp(self, arr, s, tx, ty):
-                A = (1 / s, 0, -tx / s, 0, 1 / s, -ty / s)
-                return np.asarray(Image.fromarray((arr * 255).astype(np.uint8)).transform((self.WW, self.WH), Image.AFFINE, A, Image.BILINEAR), np.float32) / 255
+            ptex = ctx.texture(photo.size, 3, np.asarray(proj_photo).tobytes()); ptex.build_mipmaps()
+            ptex.filter = (moderngl.LINEAR_MIPMAP_LINEAR, moderngl.LINEAR); ptex.anisotropy = 8
+            mk = proj_mask.filter(ImageFilter.MinFilter(7)).filter(ImageFilter.GaussianBlur(3))
+            mtex = ctx.texture(photo.size, 1, np.asarray(mk).tobytes()); mtex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+            prepared.append(dict(eye=tuple(float(q) for q in eye), R=float(R), s=float(S_full), t=tuple(float(q) for q in T_full),
+                                 psize=(float(PW), float(PH)), mvp=mvp, ptex=ptex, mtex=mtex, dtex=dtex,
+                                 bias=float(main_bias) if vi == 0 else 1.0, info=vinfo))
+            if vi > 0:
+                info.setdefault("views", []).append(vinfo)
 
-            def score(self, img, s, tx, ty):
-                rm = self.warp(img[..., 3], s, tx, ty)
-                iou = np.minimum(rm, self.pm).sum() / max(np.maximum(rm, self.pm).sum(), 1e-6)
-                rl = ndimage.gaussian_filter(self.warp(img[..., :3] @ np.array([0.299, 0.587, 0.114], np.float32), s, tx, ty), 1.0 * self.R / 320)
-                sel = (rm > 0.5) & (self.pm > 0.5)
-                if sel.sum() < 50:
-                    return iou
-                x, y = rl[sel] - rl[sel].mean(), self.pl[sel] - self.pl[sel].mean()
-                return iou + 0.5 * float((x * y).sum() / (np.sqrt((x * x).sum() * (y * y).sum()) + 1e-6))
-
-            def f(self, p):
-                yaw, pitch, roll, lfov, ls, tx, ty = p
-                fov = float(np.clip(math.exp(lfov), 6, 60))
-                return -self.score(self.render(yaw, pitch, roll, fov), math.exp(ls), tx, ty)
-
-        # pass 1: coarse grid + Nelder-Mead at `work`
-        A1 = Pass(work)
-        R = A1.R; yy, xx = np.mgrid[0:R, 0:R]; Y, X = np.mgrid[0:A1.WH, 0:A1.WW]; ap_ = A1.pm.sum()
-        cp = np.array([(X * A1.pm).sum() / max(ap_, 1e-6), (Y * A1.pm).sum() / max(ap_, 1e-6)])
-        cands = []
-        for fov in (12.0, 25.0, 40.0):
-            for pitch in range(-10, 41, 10):
-                for yaw in range(-180, 180, 15):
-                    img = A1.render(yaw, pitch, 0, fov); al = img[..., 3]; ar = al.sum()
-                    if ar < 10:
-                        continue
-                    s0 = math.sqrt(ap_ / ar); cr = np.array([(xx * al).sum() / ar, (yy * al).sum() / ar]); t0 = cp - s0 * cr
-                    cands.append((A1.score(img, s0, t0[0], t0[1]), yaw, pitch, fov, (s0, t0[0], t0[1])))
-        cands.sort(key=lambda z: -z[0])
-        best = None
-        for _, yaw, pitch, fov, (s0, tx0, ty0) in cands[:6]:
-            x0 = np.array([yaw, pitch, 0.0, math.log(fov), math.log(s0), tx0, ty0])
-            simplex = np.array([x0] + [x0 + dd for dd in np.diag([8, 6, 4, 0.3, 0.05, 6, 6])])
-            res = optimize.minimize(A1.f, x0, method="Nelder-Mead", options={"initial_simplex": simplex, "maxiter": 400, "xatol": 0.05, "fatol": 1e-4})
-            if best is None or res.fun < best.fun:
-                best = res
-        fit_pass, x = A1, best.x
-        info["fit_score"] = round(float(-best.fun), 3)
-        # pass 2: refine at full detail (same parameters, offsets scaled to the finer frame)
-        if fine_work and fine_work > work:
-            A2 = Pass(int(fine_work)); q = A2.R / A1.R
-            x2 = x.copy(); x2[5:7] *= q
-            simplex = np.array([x2] + [x2 + dd for dd in np.diag([1.5, 1.2, 0.8, 0.05, 0.01, 2.0, 2.0])])
-            res2 = optimize.minimize(A2.f, x2, method="Nelder-Mead", options={"initial_simplex": simplex, "maxiter": 120, "xatol": 0.02, "fatol": 1e-5})
-            info["fine_score_start"] = round(float(-A2.f(x2)), 4); info["fine_score"] = round(float(-res2.fun), 4)
-            if res2.fun <= A2.f(x2):
-                fit_pass, x = A2, res2.x
-        yaw, pitch, roll, lfov, ls, tx, ty = x
-        fov = float(np.clip(math.exp(lfov), 6, 60)); s = math.exp(ls); R = fit_pass.R; k = fit_pass.k
-        info.update(yaw=round(float(yaw), 2), pitch=round(float(pitch), 2), roll=round(float(roll), 2), fov=round(float(fov), 2))
-        log.info("Photo Projection: camera fit %s", info)
-
-        # preview: fitted outline over the photo
-        img = fit_pass.render(yaw, pitch, roll, fov)
-        rm = Image.fromarray((fit_pass.warp(img[..., 3], s, tx, ty) * 255).astype(np.uint8)).resize((PW, PH), Image.BILINEAR)
-        edge = np.asarray(rm.filter(ImageFilter.FIND_EDGES).filter(ImageFilter.MaxFilter(3))) > 40
-        preview = np.asarray(photo).copy(); preview[edge] = (0, 200, 255)
-
-        # projection at full photo resolution
-        S_full, T_full = s / k, np.array([tx, ty]) / k
-        mvp, eye = camera(c, r, yaw, pitch, roll, fov)
-        DR = 2048
-        dist_prog = ctx.program(vertex_shader=DIST_VS, fragment_shader=DIST_FS)
-        dtex = ctx.texture((DR, DR), 1, dtype="f4"); dfbo = ctx.framebuffer([dtex], ctx.depth_renderbuffer((DR, DR)))
-        dist_prog["mvp"].write(mvp.T.tobytes()); dist_prog["eye"].value = tuple(float(v) for v in eye)
-        dfbo.use(); ctx.enable(moderngl.DEPTH_TEST); dfbo.clear(1e9, 1e9, 1e9, 1e9)
-        for p, (_, ibo, _) in zip(parts, gl_parts):
-            ctx.vertex_array(dist_prog, [(ctx.buffer(p.pos.astype("f4").tobytes()), "3f", "in_pos")], ibo).render()
-        dtex.filter = (moderngl.NEAREST, moderngl.NEAREST)
-
-        proj_photo, proj_mask = photo, mask_img
-        if label_free is not None and edge_zone > 0:
-            import cv2
-            hfbo = ctx.framebuffer(ctx.renderbuffer((DR, DR), 4), ctx.depth_renderbuffer((DR, DR)))
-            fit_prog["mvp"].write(mvp.T.tobytes()); fit_prog["albedo"].value = 0
-            hfbo.use(); ctx.enable(moderngl.DEPTH_TEST); ctx.clear(0, 0, 0, 0)
-            for tex, _, vao in gl_parts:
-                tex.use(0); vao.render()
-            alb = np.ascontiguousarray(np.frombuffer(hfbo.read(components=4), np.uint8).reshape(DR, DR, 4)[::-1]); hfbo.release()
-            dist = np.ascontiguousarray(np.frombuffer(dtex.read(), np.float32).reshape(DR, DR)[::-1])
-            mk_arr = np.asarray(mask_img); ys, xs = np.nonzero(mk_arr > 128)
-            if len(xs):
-                bx0, bx1, by0, by1 = xs.min(), xs.max(), ys.min(), ys.max(); mg = 0.06 * max(bx1 - bx0, by1 - by0)
-                crop = (int(max(0, bx0 - mg)), int(max(0, by0 - mg)), int(min(PW, bx1 + mg)), int(min(PH, by1 + mg)))
-                cw, chh = crop[2] - crop[0], crop[3] - crop[1]; kt = 1024 / max(cw, chh); tw, th = round(cw * kt), round(chh * kt)
-                A2s = kt * S_full * R / DR; b2 = kt * (T_full - np.array([crop[0], crop[1]]))
-                Mrc = np.float32([[A2s, 0, b2[0]], [0, A2s, b2[1]]])
-                alb = cv2.GaussianBlur(alb, (0, 0), max(0.5, 0.5 / A2s))
-                proj_photo, proj_mask = zone_fix(alb, dist, dist < 1e8, r, (Mrc, (tw, th), kt), crop, photo, mask_img, label_free,
-                                                 edge_zone, mismatch, info)
-
-        ptex = ctx.texture(photo.size, 3, np.asarray(proj_photo).tobytes()); ptex.build_mipmaps()
-        ptex.filter = (moderngl.LINEAR_MIPMAP_LINEAR, moderngl.LINEAR); ptex.anisotropy = 8
-        mk = proj_mask.filter(ImageFilter.MinFilter(7)).filter(ImageFilter.GaussianBlur(3))
-        mtex = ctx.texture(photo.size, 1, np.asarray(mk).tobytes()); mtex.filter = (moderngl.LINEAR, moderngl.LINEAR)
         uv_prog = ctx.program(vertex_shader=UV_VS, fragment_shader=UV_FS)
-        for kname, val in dict(eye=tuple(float(v) for v in eye), R=float(R), s=float(S_full), t=tuple(float(v) for v in T_full),
-                               psize=(float(PW), float(PH)), photo=0, mask=1, distmap=2, eps=0.012 * r,
-                               face=(float(facing[0]), float(facing[1]))).items():
-            uv_prog[kname].value = val
-        uv_prog["mvp"].write(mvp.T.tobytes())
-        ptex.use(0); mtex.use(1); dtex.use(2)
+        uv_prog["photo"].value = 0; uv_prog["mask"].value = 1; uv_prog["distmap"].value = 2
+        uv_prog["eps"].value = 0.012 * r; uv_prog["face"].value = (float(facing[0]), float(facing[1]))
 
-        N = int(texture_size); shares = []
+        N = int(texture_size); shares = []; view_shares = np.zeros(len(prepared))
         lin = srgb_to_linear
         for p, (_, ibo, _) in zip(parts, gl_parts):
             if not p.textured:
                 continue
             vao = ctx.vertex_array(uv_prog, [(ctx.buffer(np.hstack([p.pos, p.nrm, p.uv]).astype("f4").tobytes()), "3f 3f 2f", "in_pos", "in_nrm", "in_uv")], ibo)
-            o0 = ctx.texture((N, N), 4, dtype="f4"); o1 = ctx.texture((N, N), 4, dtype="f1")
-            ufbo = ctx.framebuffer([o0, o1])
-            ufbo.use(); ctx.disable(moderngl.DEPTH_TEST); ctx.disable(moderngl.CULL_FACE); ufbo.clear(0, 0, 0, 0); vao.render()
-            proj = np.frombuffer(o0.read(), np.float32).reshape(N, N, 4)[::-1]
-            cov = np.frombuffer(o1.read(), np.uint8).reshape(N, N, 4)[::-1][..., 0] > 0
-            o0.release(); o1.release(); ufbo.release()
-            w = np.clip(proj[..., 3], 0, 1); prgb = proj[..., :3]
+            num = den = wmax = cov = None; best = None
+            for j, pv in enumerate(prepared):
+                for kname in ("eye", "R", "s", "t", "psize"):
+                    uv_prog[kname].value = pv[kname]
+                uv_prog["mvp"].write(pv["mvp"].T.tobytes())
+                pv["ptex"].use(0); pv["mtex"].use(1); pv["dtex"].use(2)
+                o0 = ctx.texture((N, N), 4, dtype="f4"); o1 = ctx.texture((N, N), 4, dtype="f1")
+                ufbo = ctx.framebuffer([o0, o1])
+                ufbo.use(); ctx.disable(moderngl.DEPTH_TEST); ctx.disable(moderngl.CULL_FACE); ufbo.clear(0, 0, 0, 0); vao.render()
+                proj = np.frombuffer(o0.read(), np.float32).reshape(N, N, 4)[::-1]
+                if cov is None:
+                    cov = np.frombuffer(o1.read(), np.uint8).reshape(N, N, 4)[::-1][..., 0] > 0
+                o0.release(); o1.release(); ufbo.release()
+                w_j = np.clip(proj[..., 3], 0, 1)
+                if len(prepared) == 1:
+                    num, den, wmax = proj[..., :3], None, w_j
+                    break
+                # the view facing a texel most squarely wins; `sharpness` keeps the hand-over narrow (no ghosting)
+                wp = (w_j * pv["bias"]) ** sharpness
+                if num is None:
+                    num = np.zeros((N, N, 3), np.float32); den = np.zeros((N, N), np.float32)
+                    wmax = np.zeros((N, N), np.float32); best = np.full((N, N), -1, np.int16); bestw = np.zeros((N, N), np.float32)
+                num += wp[..., None] * proj[..., :3]; den += wp; wmax = np.maximum(wmax, w_j)
+                upd = wp > bestw; best[upd] = j; bestw[upd] = wp[upd]
+                del proj
+            if den is None:
+                w, prgb = wmax, num
+            else:
+                prgb = np.divide(num, den[..., None], out=np.zeros_like(num), where=den[..., None] > 0); w = wmax
+                for j in range(len(prepared)):
+                    view_shares[j] += float(((best == j) & (w > 0.5) & cov).mean())
             base = np.asarray(p.albedo.resize((N, N), Image.LANCZOS), np.float32) / 255
             base_lin = lin(base)
             if match_colours:
@@ -470,9 +531,19 @@ def project_photo(glb_bytes, photo_rgb, mask=None, texture_size=4096, facing=(0.
                 wn = np.asarray(Image.fromarray((wpad * 255).astype(np.uint8)).resize(nimg.size, Image.BILINEAR), np.float32)[..., None] / 255
                 p.mat.normalTexture = Image.fromarray((nn * (1 - wn) + np.array([128, 128, 255], np.float32) * wn + 0.5).astype(np.uint8))
         info["photo_share"] = round(float(np.mean(shares)), 3) if shares else 0.0
+        if len(prepared) > 1:
+            nt = max(1, sum(1 for p in parts if p.textured))
+            for j, pv in enumerate(prepared):
+                pv["info"]["share"] = round(float(view_shares[j] / nt), 3)
     finally:
         ctx.release()
     out_bytes = scene.export(file_type="glb")
+    if len(previews) > 1:
+        H = previews[0].shape[0]
+        previews = [pv if pv.shape[0] == H else np.asarray(Image.fromarray(pv).resize((round(pv.shape[1] * H / pv.shape[0]), H), Image.BILINEAR)) for pv in previews]
+        preview = np.concatenate(previews, axis=1)
+    else:
+        preview = previews[0]
     return out_bytes, preview, info
 
 
